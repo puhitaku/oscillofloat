@@ -1,0 +1,29 @@
+@import 'tailwindcss';
+
+/* The oscilloscope palette: black and greys, phosphor green as the accent. */
+@theme {
+  --color-scope-50: #e6ffef;
+  --color-scope-200: #a8ffc6;
+  --color-scope-400: #7dffa8;
+  --color-scope-500: #3dff7f;
+  --color-scope-700: #1a8a48;
+  --color-scope-900: #0b3a20;
+  --color-scope-950: #04110a;
+}
+
+/* The page is exactly the viewport: nothing scrolls or rubber-bands, so a
+   touch or swipe never moves the screen. Pages that need scrolling (admin)
+   scroll inside their own container. */
+html,
+body,
+#app {
+  height: 100dvh;
+  margin: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: #000;
+  color: #e4e4e7;
+  color-scheme: dark;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+}

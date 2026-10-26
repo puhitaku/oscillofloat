@@ -1,0 +1,554 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: oscillofloat (CloudFront, S3, EC2, Cognito)
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Domain the site is served on. Also the passkey relying party ID.
+    AllowedPattern: "^[a-z0-9.-]+$"
+  CertificateArn:
+    Type: String
+    Description: ACM certificate for DomainName in us-east-1 (output of infra/cert.yaml).
+    AllowedPattern: "^arn:aws[a-z-]*:acm:us-east-1:[0-9]{12}:certificate/.+$"
+  DatabaseBucketName:
+    Type: String
+    Description: Existing S3 bucket that holds the Litestream replica of the database (created by scripts/create-db-bucket.sh).
+  InstanceType:
+    Type: String
+    Default: t4g.nano
+    Description: An arm64 (Graviton) instance type.
+  CloudFrontOriginFacingPrefixListId:
+    Type: String
+    Description: ID of the com.amazonaws.global.cloudfront.origin-facing managed prefix list in this region.
+    AllowedPattern: "^pl-[0-9a-f]+$"
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  LitestreamVersion:
+    Type: String
+    Default: 0.3.14
+    Description: Litestream 0.3.x release installed on the instance.
+    AllowedPattern: "^0\\.3\\.[0-9]+$"
+  UploadRate:
+    Type: String
+    Default: ""
+    Description: Uploads allowed per client address per minute. Empty keeps the backend's default.
+    AllowedPattern: "^[0-9]*$"
+  UserPoolDeletionProtection:
+    Type: String
+    Default: ACTIVE
+    AllowedValues: [ACTIVE, INACTIVE]
+    Description: Set to INACTIVE only right before deleting the stack.
+
+Mappings:
+  ManagedPolicies:
+    Cache:
+      CachingOptimized: 658327ea-f89d-4fab-a63d-7e88639e58f6
+      CachingDisabled: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+    OriginRequest:
+      AllViewerExceptHostHeader: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+Conditions:
+  HasUploadRate: !Not [!Equals [!Ref UploadRate, ""]]
+  IsUsEast1: !Equals [!Ref AWS::Region, us-east-1]
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public"
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: oscillofloat backend, reachable from CloudFront only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: CloudFront origin-facing addresses
+          IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourcePrefixListId: !Ref CloudFrontOriginFacingPrefixListId
+      SecurityGroupEgress:
+        - Description: Updates, GitHub, S3, SSM and Cognito
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  DeployBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: storage
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DatabaseReplicaBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${DatabaseBucketName}"
+              - Sid: DatabaseReplicaObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${DatabaseBucketName}/*"
+              - Sid: DeployBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DeployBucket.Arn
+              - Sid: DeployObjects
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${DeployBucket.Arn}/*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: DefaultRoute
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 8
+            Encrypted: true
+            DeleteOnTermination: true
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          SubnetId: !Ref PublicSubnet
+          GroupSet:
+            - !Ref BackendSecurityGroup
+          AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+            MIME-Version: 1.0
+
+            --==BOUNDARY==
+            Content-Type: text/cloud-config; charset="us-ascii"
+            MIME-Version: 1.0
+
+            #cloud-config
+            # Not once per instance (the default): CloudFormation applies a
+            # UserData change by stopping and starting the instance, and the
+            # script below has to run again for the change to take effect.
+            cloud_final_modules:
+              - [scripts-user, always]
+
+            --==BOUNDARY==
+            Content-Type: text/x-shellscript; charset="us-ascii"
+            MIME-Version: 1.0
+
+            #!/bin/bash
+            # No redirection to the console: cloud-init already copies this
+            # script's output there and to /var/log/cloud-init-output.log.
+            set -euo pipefail
+
+            # Not straight to the download: the Elastic IP is associated only after the
+            # instance is running, so the internet may be unreachable at first.
+            for attempt in $(seq 1 120); do
+              curl -fsS -o /dev/null --max-time 5 https://github.com && break
+              [ "$attempt" -lt 120 ] || exit 1
+              sleep 5
+            done
+
+            # No dnf install: it is OOM-killed on a 0.5 GiB instance, and tar,
+            # curl and the AWS CLI are already on the image.
+            # Not the rpm: the 0.3 releases ship only tarballs and debs for arm64.
+            curl -fsSL "https://github.com/benbjohnson/litestream/releases/download/v${LitestreamVersion}/litestream-v${LitestreamVersion}-linux-arm64.tar.gz" \
+              | tar -xz -C /usr/bin litestream
+            /usr/bin/litestream version
+
+            id oscillofloat >/dev/null 2>&1 \
+              || useradd --system --home-dir /var/lib/oscillofloat --shell /sbin/nologin oscillofloat
+            install -d -o oscillofloat -g oscillofloat -m 0750 /var/lib/oscillofloat
+            install -d -m 0755 /etc/oscillofloat
+
+            cat > /etc/oscillofloat/env <<'EOF'
+            AWS_REGION=${AWS::Region}
+            COGNITO_REGION=${AWS::Region}
+            COGNITO_USER_POOL_ID=${UserPool}
+            COGNITO_CLIENT_ID=${UserPoolClient}
+            DATABASE_BUCKET=${DatabaseBucketName}
+            DEPLOY_BUCKET=${DeployBucket}
+            OSCILLOFLOAT_FLAGS="${ExtraFlags}"
+            EOF
+
+            cat > /etc/litestream.yml <<'EOF'
+            dbs:
+              - path: /var/lib/oscillofloat/db.sqlite
+                replicas:
+                  - type: s3
+                    bucket: ${DatabaseBucketName}
+                    path: db
+                    region: ${AWS::Region}
+            EOF
+            chmod 0644 /etc/litestream.yml
+
+            cat > /usr/local/bin/oscillofloat-update <<'EOF'
+            #!/bin/bash
+            set -euo pipefail
+            aws s3 cp --no-progress --region ${AWS::Region} s3://${DeployBucket}/oscillofloat /usr/local/bin/oscillofloat.new
+            chmod 0755 /usr/local/bin/oscillofloat.new
+            mv -f /usr/local/bin/oscillofloat.new /usr/local/bin/oscillofloat
+            systemctl restart oscillofloat.service
+            for attempt in $(seq 1 30); do
+              systemctl is-active --quiet oscillofloat.service && break
+              sleep 1
+            done
+            systemctl --no-pager --lines=20 status oscillofloat.service
+            EOF
+            chmod 0755 /usr/local/bin/oscillofloat-update
+
+            # ConditionPathExists instead of a failing start: the first boot has
+            # no binary until scripts/deploy-backend.sh runs oscillofloat-update.
+            cat > /etc/systemd/system/oscillofloat.service <<'EOF'
+            [Unit]
+            Description=oscillofloat backend, replicated by Litestream
+            After=network-online.target
+            Wants=network-online.target
+            ConditionPathExists=/usr/local/bin/oscillofloat
+            StartLimitIntervalSec=0
+
+            [Service]
+            User=oscillofloat
+            Group=oscillofloat
+            EnvironmentFile=/etc/oscillofloat/env
+            ExecStartPre=/usr/bin/litestream restore -if-db-not-exists -if-replica-exists /var/lib/oscillofloat/db.sqlite
+            ExecStart=/usr/bin/litestream replicate -exec "/usr/local/bin/oscillofloat -addr 0.0.0.0:8080 -db /var/lib/oscillofloat/db.sqlite -trust-proxy -cognito-region ${!COGNITO_REGION} -cognito-user-pool-id ${!COGNITO_USER_POOL_ID} -cognito-client-id ${!COGNITO_CLIENT_ID} ${!OSCILLOFLOAT_FLAGS}"
+            Restart=always
+            RestartSec=5
+            NoNewPrivileges=true
+            PrivateTmp=true
+            ProtectHome=true
+            ProtectSystem=strict
+            ReadWritePaths=/var/lib/oscillofloat
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            systemctl daemon-reload
+            systemctl enable oscillofloat.service
+
+            # Not left to scripts/deploy-backend.sh alone: a replacement
+            # instance has to come back with the last deployed binary.
+            if aws s3api head-object --region ${AWS::Region} --bucket ${DeployBucket} --key oscillofloat >/dev/null 2>&1; then
+              /usr/local/bin/oscillofloat-update
+            fi
+
+            --==BOUNDARY==--
+          - ExtraFlags: !If [HasUploadRate, !Sub "-upload-rate ${UploadRate}", ""]
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  ElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIp.AllocationId
+      InstanceId: !Ref Instance
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Ref AWS::StackName
+      UserPoolTier: ESSENTIALS
+      DeletionProtection: !Ref UserPoolDeletionProtection
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: "OFF"
+      WebAuthnRelyingPartyID: !Ref DomainName
+      WebAuthnUserVerification: required
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 16
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+        SignInPolicy:
+          AllowedFirstAuthFactors: [PASSWORD, WEB_AUTHN]
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: admin_only
+            Priority: 1
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        InviteMessageTemplate:
+          EmailSubject: Your oscillofloat operator account
+          EmailMessage: !Sub |
+            <p>An operator account for oscillofloat has been created.</p>
+            <p>Username: {username}<br>Temporary password: {####}</p>
+            <p>Open <a href="https://${DomainName}/admin">https://${DomainName}/admin</a>, expand "初回設定" (first-time setup), sign in with your email address and the temporary password, choose a new password, and register a passkey when the browser asks.</p>
+            <p>The temporary password expires in 7 days. From then on, sign in with the passkey.</p>
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${AWS::StackName}-admin"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      IdTokenValidity: 1
+      AccessTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        IdToken: hours
+        AccessToken: hours
+        RefreshToken: days
+
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-frontend"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SpaRouteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${AWS::StackName}-spa-routes"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Serve index.html for SPA routes such as /float and /admin
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var last = request.uri.substring(request.uri.lastIndexOf('/') + 1);
+          if (last.indexOf('.') === -1) {
+            request.uri = '/index.html';
+          }
+          return request;
+        }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Ref DomainName
+        Aliases:
+          - !Ref DomainName
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          MinimumProtocolVersion: TLSv1.2_2021
+          SslSupportMethod: sni-only
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        # Not PriceClass_All: it only adds the most expensive edge locations
+        # (South America, Oceania), far from where an installation's visitors are.
+        PriceClass: PriceClass_200
+        DefaultRootObject: index.html
+        Origins:
+          - Id: frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: backend
+            # Not the instance's PublicDnsName: it is resolved before the
+            # Elastic IP is attached, and CloudFront does not take an IP address.
+            DomainName: !Sub
+              - "ec2-${Dashed}.${Suffix}"
+              - Dashed: !Join ["-", !Split [".", !GetAtt ElasticIp.PublicIp]]
+                Suffix: !If [IsUsEast1, compute-1.amazonaws.com, !Sub "${AWS::Region}.compute.amazonaws.com"]
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 8080
+              IpAddressType: ipv4
+              OriginReadTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: frontend
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: !FindInMap [ManagedPolicies, Cache, CachingOptimized]
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SpaRouteFunction.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /ws
+            TargetOriginId: backend
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: !FindInMap [ManagedPolicies, Cache, CachingDisabled]
+            OriginRequestPolicyId: !FindInMap [ManagedPolicies, OriginRequest, AllViewerExceptHostHeader]
+          - PathPattern: /api/*
+            TargetOriginId: backend
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: !FindInMap [ManagedPolicies, Cache, CachingDisabled]
+            OriginRequestPolicyId: !FindInMap [ManagedPolicies, OriginRequest, AllViewerExceptHostHeader]
+
+Outputs:
+  DistributionId:
+    Value: !Ref Distribution
+  DistributionDomainName:
+    Value: !GetAtt Distribution.DomainName
+  FrontendBucket:
+    Value: !Ref FrontendBucket
+  DeployBucket:
+    Value: !Ref DeployBucket
+  InstanceId:
+    Value: !Ref Instance
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  ElasticIp:
+    Value: !GetAtt ElasticIp.PublicIp
